@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: AWS Conformance Pack with Remediation for S3 Public Access Blocking
+
+Parameters:
+  ConfigDeliveryBucketName:
+    Type: String
+    Default: config-delivery-bucket
+    Description: Name of the S3 bucket for AWS Config delivery channel
+
+Resources:
+
+  ### Lambda Function ###
+  RemediationLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: RemediateS3PublicAccess
+      Runtime: java11
+      Handler: conformance.pack.LambdaHandler::handleRequest
+      CodeUri: Remediation
+      MemorySize: 512
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  RemediationLambdaFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${RemediationLambdaFunction}'
+      RetentionInDays: 7
+
+  ### Lambda Execution Role ###
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaExecutionRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:Put*
+                Resource: '*'
+
+  ### SSM Automation Document ###
+  RemediationSSMDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Name: Remediate-S3-Public-Access
+      Content:
+        schemaVersion: '0.3'
+        description: Remediation document to block public access on S3 buckets
+        assumeRole: "{{AutomationAssumeRole}}"
+        parameters:
+          BucketName:
+            type: String
+            description: 'Name of the non-compliant S3 bucket'
+          AutomationAssumeRole:
+            type: AWS::IAM::Role::Arn
+            description: 'Remediation role to invoke lambda'
+        mainSteps:
+          - name: RemediateS3Bucket
+            action: 'aws:invokeLambdaFunction'
+            onFailure: Abort
+            inputs:
+              FunctionName: !Ref RemediationLambdaFunction
+              Payload: '{"BucketName": "{{BucketName}}"}'
+
+  ### Config Remediation Role ###
+  ConfigRemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ConfigRemediationRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - config.amazonaws.com
+                - ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ConfigRemediationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssm:StartAutomationExecution'
+                  - 'iam:PassRole'
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/${RemediationSSMDocument}"
+        - PolicyName: SSMAutomationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt RemediationLambdaFunction.Arn
+
+  ### Config Delivery Channel Bucket ###
+  ConfigDeliveryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ConfigDeliveryBucketName}-${AWS::AccountId}-${AWS::Region}
+      AccessControl: BucketOwnerFullControl
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  ### Conformance Pack ###
+  S3ConformancePack:
+    Type: AWS::Config::ConformancePack
+    Properties:
+      ConformancePackName: S3PublicAccessConformancePack
+      TemplateBody: !Sub |
+        ---
+        Resources:
+          S3BucketPublicAccessProhibitedRule:
+            Type: AWS::Config::ConfigRule
+            Properties:
+              ConfigRuleName: s3-bucket-level-public-access-prohibited
+              Source:
+                Owner: AWS
+                SourceIdentifier: S3_BUCKET_LEVEL_PUBLIC_ACCESS_PROHIBITED
+          S3BucketPublicAccessRemediation:
+            Type: "AWS::Config::RemediationConfiguration"
+            Properties:
+              ConfigRuleName: s3-bucket-level-public-access-prohibited
+              TargetType: "SSM_DOCUMENT"
+              TargetId: ${RemediationSSMDocument}
+              Parameters:
+                AutomationAssumeRole:
+                  StaticValue:
+                    Values:
+                      - ${ConfigRemediationRole.Arn}
+                BucketName:
+                  ResourceValue:
+                    Value: "RESOURCE_ID"
+              Automatic: True
+              MaximumAutomaticAttempts: 5
+              RetryAttemptSeconds: 60
+      DeliveryS3Bucket: !Ref ConfigDeliveryBucket
+
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the remediation Lambda function
+    Value: !Ref RemediationLambdaFunction
+  ConfigRemediationRoleName:
+    Description: Role name for the Config remediation
+    Value: !Ref ConfigRemediationRole
+  SSMDocumentName:
+    Description: Name of the SSM document for remediation
+    Value: !Ref RemediationSSMDocument
+  ConfigDeliveryBucketName:
+    Description: Name of the S3 bucket for AWS Config delivery channel
+    Value: !Ref ConfigDeliveryBucket
+  ConformcePackName:
+    Description: Name of the conformance pack
+    Value: !Ref S3ConformancePack
